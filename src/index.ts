@@ -1,18 +1,22 @@
 import {
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
   ChannelType,
   Client,
   GatewayIntentBits,
-  type ColorResolvable,
   PermissionsBitField,
   REST,
   Routes,
   SlashCommandBuilder,
   type ChatInputCommandInteraction,
+  type Guild,
   type GuildMember,
 } from 'discord.js';
 import { loadConfig } from './config';
 import { createPlan } from './ai';
-import { formatPlan, PlannedAction } from './plan';
+import { formatPlan, BotPlan } from './plan';
+import { executeActions } from './executor';
 
 const config = loadConfig();
 
@@ -20,27 +24,78 @@ const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers],
 });
 
-const command = new SlashCommandBuilder()
-  .setName('admin-plan')
-  .setDescription('Plan and optionally execute Discord admin tasks from a prompt')
-  .addStringOption((option) =>
-    option.setName('prompt').setDescription('Describe the channels, roles, and permissions you want').setRequired(true),
+// ──────────────────────────────────────────────────────────────────────────────
+// In-memory store for pending (unconfirmed) plans
+// ──────────────────────────────────────────────────────────────────────────────
+
+interface PendingPlan {
+  plan: BotPlan;
+  userId: string;
+  guildId: string;
+  expiresAt: number;
+}
+
+const pendingPlans = new Map<string, PendingPlan>();
+
+// Purge expired plans every 5 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, entry] of pendingPlans) {
+    if (entry.expiresAt < now) pendingPlans.delete(id);
+  }
+}, 5 * 60_000);
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Slash command definitions
+// ──────────────────────────────────────────────────────────────────────────────
+
+const adminCommand = new SlashCommandBuilder()
+  .setName('admin')
+  .setDescription('Plan and execute Discord admin tasks from a natural language prompt')
+  .addStringOption((opt) =>
+    opt
+      .setName('prompt')
+      .setDescription(
+        'Describe what you want, e.g. "create a Moderator role and give it to @alice"',
+      )
+      .setRequired(true),
   )
-  .addBooleanOption((option) =>
-    option.setName('execute').setDescription('Execute the plan immediately after previewing it').setRequired(false),
+  .addBooleanOption((opt) =>
+    opt
+      .setName('execute')
+      .setDescription('Execute immediately without showing a preview (default: false)')
+      .setRequired(false),
   );
+
+const listCommand = new SlashCommandBuilder()
+  .setName('admin-list')
+  .setDescription('List current channels and roles in this server');
+
+const helpCommand = new SlashCommandBuilder()
+  .setName('admin-help')
+  .setDescription('Show usage guide and example prompts for the admin bot');
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Command registration
+// ──────────────────────────────────────────────────────────────────────────────
 
 async function registerCommands(): Promise<void> {
   const rest = new REST({ version: '10' }).setToken(config.discordToken);
-  const body = [command.toJSON()];
+  const body = [adminCommand.toJSON(), listCommand.toJSON(), helpCommand.toJSON()];
 
   if (config.guildId) {
     await rest.put(Routes.applicationGuildCommands(config.clientId, config.guildId), { body });
+    console.log('Registered guild commands.');
     return;
   }
 
   await rest.put(Routes.applicationCommands(config.clientId), { body });
+  console.log('Registered global commands (may take up to 1 hour to propagate).');
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Access control
+// ──────────────────────────────────────────────────────────────────────────────
 
 function canUseBot(member: GuildMember): boolean {
   if (member.permissions.has(PermissionsBitField.Flags.Administrator)) {
@@ -51,28 +106,133 @@ function canUseBot(member: GuildMember): boolean {
     return false;
   }
 
-  return config.adminRoleIds.some((roleId) => member.roles.cache.has(roleId));
+  return config.adminRoleIds.some((id) => member.roles.cache.has(id));
 }
 
-function roleOptionsFromGuildRoles(guild: NonNullable<ChatInputCommandInteraction['guild']>) {
-  return Array.from(guild.roles.cache.values())
-    .filter((role) => role.id !== guild.id)
-    .map((role) => ({ id: role.id, name: role.name }));
+// ──────────────────────────────────────────────────────────────────────────────
+// Guild context helpers
+// ──────────────────────────────────────────────────────────────────────────────
+
+function guildChannelList(guild: Guild): string[] {
+  return guild.channels.cache
+    .filter((c) => c.type !== ChannelType.GuildCategory)
+    .map((c) => c.name)
+    .slice(0, 50);
 }
 
-async function handlePlan(interaction: ChatInputCommandInteraction): Promise<void> {
-  if (!interaction.inGuild()) {
+function guildRoleList(guild: Guild): string[] {
+  return guild.roles.cache
+    .filter((r) => r.id !== guild.id)
+    .map((r) => r.name)
+    .slice(0, 50);
+}
+
+function guildMemberSample(guild: Guild): string[] {
+  return guild.members.cache
+    .map((m) => m.displayName)
+    .slice(0, 30);
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// /admin handler
+// ──────────────────────────────────────────────────────────────────────────────
+
+async function handleAdmin(interaction: ChatInputCommandInteraction): Promise<void> {
+  if (!interaction.inGuild() || !interaction.guild) {
     await interaction.reply({ content: 'This command can only be used in a server.', ephemeral: true });
     return;
   }
 
   const guild = interaction.guild;
+  const member = await guild.members.fetch(interaction.user.id);
 
-  if (!guild) {
+  if (!canUseBot(member)) {
+    await interaction.reply({
+      content:
+        'You need to be a server **Administrator** or have one of the configured bot-manager roles to use this bot.',
+      ephemeral: true,
+    });
+    return;
+  }
+
+  const prompt = interaction.options.getString('prompt', true);
+  const executeImmediately = interaction.options.getBoolean('execute') ?? false;
+
+  // Defer so we have time to call the AI
+  await interaction.deferReply({ ephemeral: true });
+
+  // Fetch members so we can resolve them by name
+  try {
+    await guild.members.fetch();
+  } catch {
+    // Partial member cache is fine; we will search later
+  }
+
+  let plan: BotPlan;
+
+  try {
+    plan = await createPlan(config, {
+      guildName: guild.name,
+      prompt,
+      existingChannels: guildChannelList(guild),
+      existingRoles: guildRoleList(guild),
+      memberSample: guildMemberSample(guild),
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await interaction.editReply(`❌ Failed to generate a plan: ${message}`);
+    return;
+  }
+
+  const preview = formatPlan(plan);
+
+  if (executeImmediately) {
+    const results = await executeActions(guild, plan.actions, interaction.user.tag);
+    const body = [`${preview}`, '', '**Execution results:**', ...results].join('\n');
+    await interaction.editReply(truncate(body));
+    return;
+  }
+
+  // Store plan for button confirmation (expires in 10 minutes)
+  const planId = crypto.randomUUID();
+  pendingPlans.set(planId, {
+    plan,
+    userId: interaction.user.id,
+    guildId: guild.id,
+    expiresAt: Date.now() + 10 * 60_000,
+  });
+
+  const confirmBtn = new ButtonBuilder()
+    .setCustomId(`admin:confirm:${planId}`)
+    .setLabel('Execute')
+    .setStyle(ButtonStyle.Success)
+    .setEmoji('✅');
+
+  const cancelBtn = new ButtonBuilder()
+    .setCustomId(`admin:cancel:${planId}`)
+    .setLabel('Cancel')
+    .setStyle(ButtonStyle.Danger)
+    .setEmoji('❌');
+
+  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(confirmBtn, cancelBtn);
+
+  await interaction.editReply({
+    content: `${preview}\n\nConfirm to apply these changes, or cancel to discard.`,
+    components: [row],
+  });
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// /admin-list handler
+// ──────────────────────────────────────────────────────────────────────────────
+
+async function handleList(interaction: ChatInputCommandInteraction): Promise<void> {
+  if (!interaction.inGuild() || !interaction.guild) {
     await interaction.reply({ content: 'This command can only be used in a server.', ephemeral: true });
     return;
   }
 
+  const guild = interaction.guild;
   const member = await guild.members.fetch(interaction.user.id);
 
   if (!canUseBot(member)) {
@@ -80,196 +240,199 @@ async function handlePlan(interaction: ChatInputCommandInteraction): Promise<voi
     return;
   }
 
-  const prompt = interaction.options.getString('prompt', true);
-  const execute = interaction.options.getBoolean('execute') ?? false;
+  const lines: string[] = ['**Channels**'];
 
-  await interaction.deferReply({ ephemeral: true });
+  // Categories + their children
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const pos = (c: any): number => (c as { position?: number }).position ?? 0;
 
-  const plan = await createPlan(config, {
-    guildName: guild.name,
-    prompt,
-    roleOptions: roleOptionsFromGuildRoles(guild),
-  });
+  const categories = guild.channels.cache
+    .filter((c) => c.type === ChannelType.GuildCategory)
+    .sort((a, b) => pos(a) - pos(b));
 
-  const preview = formatPlan(plan);
-
-  if (!execute) {
-    await interaction.editReply(`${preview}\n\nRe-run with execute:true to apply these changes.`);
-    return;
-  }
-
-  const results = await executePlan(interaction, plan.actions);
-  await interaction.editReply(`${preview}\n\nExecution results:\n${results.join('\n')}`);
-}
-
-async function executePlan(interaction: ChatInputCommandInteraction, actions: PlannedAction[]): Promise<string[]> {
-  const results: string[] = [];
-  const guild = interaction.guild;
-
-  if (!guild) {
-    throw new Error('Guild context missing');
-  }
-
-  for (const action of actions) {
-    switch (action.type) {
-      case 'create_role': {
-        const role = await guild.roles.create({
-          name: action.name,
-          color: action.color as ColorResolvable | undefined,
-          hoist: action.hoist,
-          mentionable: action.mentionable,
-          reason: `Requested by ${interaction.user.tag}`,
-        });
-        results.push(`Created role ${role.name}`);
-        break;
-      }
-      case 'create_channel': {
-        const overwrites: Array<{ id: string; allow?: bigint[]; deny?: bigint[] }> = [];
-        if (action.private || action.channelType === 'category') {
-          overwrites.push({ id: guild.roles.everyone.id, deny: [PermissionsBitField.Flags.ViewChannel] });
-        }
-        for (const roleName of action.allowedRoles ?? []) {
-          const role = findRoleByName(guild, roleName);
-          if (role) {
-            overwrites.push({ id: role.id, allow: [PermissionsBitField.Flags.ViewChannel] });
-          }
-        }
-        for (const roleName of action.deniedRoles ?? []) {
-          const role = findRoleByName(guild, roleName);
-          if (role) {
-            overwrites.push({ id: role.id, deny: [PermissionsBitField.Flags.ViewChannel] });
-          }
-        }
-
-        const channel = await guild.channels.create({
-          name: action.name,
-          type:
-            action.channelType === 'text'
-              ? ChannelType.GuildText
-              : action.channelType === 'voice'
-                ? ChannelType.GuildVoice
-                : ChannelType.GuildCategory,
-          parent: action.category ? findCategoryByName(guild, action.category)?.id : undefined,
-          topic: action.channelType === 'text' ? action.topic : undefined,
-          permissionOverwrites: overwrites,
-          reason: `Requested by ${interaction.user.tag}`,
-        });
-
-        results.push(`Created channel ${channel.name}`);
-        break;
-      }
-      case 'assign_role': {
-        const role = findRoleByName(guild, action.role);
-        if (!role) {
-          results.push(`Skipped assigning missing role ${action.role}`);
-          break;
-        }
-
-        for (const userRef of action.users) {
-          const member = await resolveMember(guild, userRef);
-          if (!member) {
-            results.push(`Skipped missing user ${userRef}`);
-            continue;
-          }
-          await member.roles.add(role, `Requested by ${interaction.user.tag}`);
-          results.push(`Assigned ${role.name} to ${member.user.tag}`);
-        }
-        break;
-      }
-      case 'set_channel_access': {
-        const channel = findChannelByName(guild, action.channel);
-        if (!channel) {
-          results.push(`Skipped missing channel ${action.channel}`);
-          break;
-        }
-
-        const overwrites: Record<string, { allow?: bigint[]; deny?: bigint[] }> = {};
-
-        for (const roleName of action.allowedRoles ?? []) {
-          const role = findRoleByName(guild, roleName);
-          if (role) {
-            overwrites[role.id] = { allow: [PermissionsBitField.Flags.ViewChannel] };
-          }
-        }
-        for (const roleName of action.deniedRoles ?? []) {
-          const role = findRoleByName(guild, roleName);
-          if (role) {
-            overwrites[role.id] = { deny: [PermissionsBitField.Flags.ViewChannel] };
-          }
-        }
-
-        if (action.everyone) {
-          overwrites[guild.roles.everyone.id] =
-            action.everyone === 'allow'
-              ? { allow: [PermissionsBitField.Flags.ViewChannel] }
-              : { deny: [PermissionsBitField.Flags.ViewChannel] };
-        }
-
-        const manageableChannel = channel as typeof channel & {
-          permissionOverwrites: { set: (overwritesToSet: Array<{ id: string; allow?: bigint[]; deny?: bigint[] }>, reason?: string) => Promise<unknown> };
-        };
-
-        await manageableChannel.permissionOverwrites.set(
-          Object.entries(overwrites).map(([id, permissions]) => ({ id, ...permissions })),
-          `Requested by ${interaction.user.tag}`,
-        );
-        results.push(`Updated access for ${channel.name}`);
-        break;
-      }
+  for (const category of categories.values()) {
+    lines.push(`\n📁 **${category.name}**`);
+    const children = guild.channels.cache
+      .filter((c) => c.parentId === category.id)
+      .sort((a, b) => pos(a) - pos(b));
+    for (const ch of children.values()) {
+      const icon = ch.type === ChannelType.GuildVoice ? '🔊' : '💬';
+      lines.push(`  ${icon} #${ch.name}`);
     }
   }
 
-  return results;
-}
-
-function findRoleByName(guild: NonNullable<ChatInputCommandInteraction['guild']>, name: string) {
-  return guild.roles.cache.find((role) => role.name.toLowerCase() === name.toLowerCase() || role.id === name);
-}
-
-function findCategoryByName(guild: NonNullable<ChatInputCommandInteraction['guild']>, name: string) {
-  return guild.channels.cache.find(
-    (channel) => channel.type === ChannelType.GuildCategory && channel.name.toLowerCase() === name.toLowerCase(),
+  // Uncategorised channels
+  const uncategorised = guild.channels.cache.filter(
+    (c) =>
+      c.parentId === null &&
+      (c.type === ChannelType.GuildText || c.type === ChannelType.GuildVoice),
   );
-}
-
-function findChannelByName(guild: NonNullable<ChatInputCommandInteraction['guild']>, name: string) {
-  return guild.channels.cache.find((channel) => channel.name.toLowerCase() === name.toLowerCase() || channel.id === name);
-}
-
-async function resolveMember(guild: NonNullable<ChatInputCommandInteraction['guild']>, reference: string) {
-  const idMatch = reference.match(/^<?@!?([0-9]+)>?$/);
-  const memberId = idMatch?.[1] ?? reference;
-
-  try {
-    return await guild.members.fetch(memberId);
-  } catch {
-    return null;
+  if (uncategorised.size > 0) {
+    lines.push('\n📁 **[No category]**');
+    for (const ch of uncategorised.values()) {
+      const icon = ch.type === ChannelType.GuildVoice ? '🔊' : '💬';
+      lines.push(`  ${icon} #${ch.name}`);
+    }
   }
+
+  // Roles
+  lines.push('\n**Roles**');
+  const roles = guild.roles.cache
+    .filter((r) => r.id !== guild.id)
+    .sort((a, b) => b.rawPosition - a.rawPosition);
+
+  for (const role of roles.values()) {
+    const perms: string[] = [];
+    if (role.permissions.has(PermissionsBitField.Flags.Administrator)) perms.push('Admin');
+    else if (role.permissions.has(PermissionsBitField.Flags.ManageMessages)) perms.push('Mod');
+    const suffix = perms.length ? ` *(${perms.join(', ')})*` : '';
+    lines.push(`🏷️ @${role.name}${suffix}`);
+  }
+
+  await interaction.reply({ content: truncate(lines.join('\n')), ephemeral: true });
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// /admin-help handler
+// ──────────────────────────────────────────────────────────────────────────────
+
+async function handleHelp(interaction: ChatInputCommandInteraction): Promise<void> {
+  const examplePrompts = [
+    '`Create a #general channel (public) and a #staff channel (admins only)`',
+    '`Create a Moderator role with manage_messages, kick_members, mute_members`',
+    '`Create a Moderator role and assign it to @alice and @bob`',
+    '`Create a Staff category. Inside it, add #staff-chat (private, Moderator only) and #announcements (private, Moderator only)`',
+    '`Create a voice channel called Gaming Lounge with a 10-user limit`',
+    '`Make #general public and #admin-chat admin-only`',
+    '`Remove the Moderator role from @charlie`',
+    '`Delete the old-bots channel`',
+  ].join('\n');
+
+  const configNote =
+    config.adminRoleIds.length > 0
+      ? `Configured bot-manager roles: ${config.adminRoleIds.length}`
+      : 'No bot-manager roles configured — only server Administrators can use this bot.';
+
+  const content = [
+    '## Discord Admin Bot',
+    'Use `/admin` with a natural language prompt to manage your server.',
+    '',
+    '**Who can use it**',
+    '• Server Administrators',
+    '• Members with a role listed in `ADMIN_ROLE_IDS`',
+    `*(${configNote})*`,
+    '',
+    '**Commands**',
+    '• `/admin prompt:<text>` — generate a plan; click **Execute** to apply it',
+    '• `/admin prompt:<text> execute:true` — apply changes immediately (no preview)',
+    '• `/admin-list` — show all channels and roles',
+    '• `/admin-help` — show this message',
+    '',
+    '**Example prompts**',
+    examplePrompts,
+    '',
+    '**Supported actions**',
+    '• Create / delete text channels, voice channels, and categories',
+    '• Set channel visibility (public, admin-only, or role-specific)',
+    '• Create / delete roles with custom permissions and colors',
+    '• Assign / remove roles from users',
+  ].join('\n');
+
+  await interaction.reply({ content, ephemeral: true });
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Utility
+// ──────────────────────────────────────────────────────────────────────────────
+
+function truncate(text: string, maxLength = 1990): string {
+  if (text.length <= maxLength) return text;
+  return text.slice(0, maxLength - 3) + '...';
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Bot events
+// ──────────────────────────────────────────────────────────────────────────────
 
 client.once('ready', async () => {
-  await registerCommands();
   console.log(`Logged in as ${client.user?.tag}`);
+  try {
+    await registerCommands();
+  } catch (error) {
+    console.error('Failed to register commands:', error);
+  }
 });
 
 client.on('interactionCreate', async (interaction) => {
-  if (!interaction.isChatInputCommand() || interaction.commandName !== 'admin-plan') {
+  // ── Button interactions ───────────────────────────────────────────────────
+  if (interaction.isButton()) {
+    const parts = interaction.customId.split(':');
+    if (parts[0] !== 'admin') return;
+
+    const [, action, planId] = parts;
+    const pending = planId ? pendingPlans.get(planId) : undefined;
+
+    if (!pending) {
+      await interaction.update({ content: '⏰ This plan has expired. Run `/admin` again.', components: [] });
+      return;
+    }
+
+    if (interaction.user.id !== pending.userId) {
+      await interaction.reply({ content: "You can't confirm another user's plan.", ephemeral: true });
+      return;
+    }
+
+    if (!interaction.guild || interaction.guild.id !== pending.guildId) {
+      await interaction.update({ content: '❌ Guild mismatch.', components: [] });
+      return;
+    }
+
+    pendingPlans.delete(planId);
+
+    if (action === 'cancel') {
+      await interaction.update({ content: '❌ Cancelled — no changes were made.', components: [] });
+      return;
+    }
+
+    if (action === 'confirm') {
+      await interaction.deferUpdate();
+      const results = await executeActions(
+        interaction.guild,
+        pending.plan.actions,
+        interaction.user.tag,
+      );
+      const body = [formatPlan(pending.plan), '', '**Execution results:**', ...results].join('\n');
+      await interaction.editReply({ content: truncate(body), components: [] });
+    }
+
     return;
   }
 
+  // ── Slash commands ────────────────────────────────────────────────────────
+  if (!interaction.isChatInputCommand()) return;
+
+  const handler: Record<string, (i: ChatInputCommandInteraction) => Promise<void>> = {
+    admin: handleAdmin,
+    'admin-list': handleList,
+    'admin-help': handleHelp,
+  };
+
+  const fn = handler[interaction.commandName];
+  if (!fn) return;
+
   try {
-    await handlePlan(interaction);
+    await fn(interaction);
   } catch (error) {
-    const message = error instanceof Error ? error.message : 'Unknown error';
+    const message = error instanceof Error ? error.message : String(error);
     if (interaction.deferred || interaction.replied) {
-      await interaction.editReply(`Failed: ${message}`);
+      await interaction.editReply(`❌ ${message}`);
     } else {
-      await interaction.reply({ content: `Failed: ${message}`, ephemeral: true });
+      await interaction.reply({ content: `❌ ${message}`, ephemeral: true });
     }
   }
 });
 
 client.login(config.discordToken).catch((error) => {
-  console.error('Failed to start bot', error);
+  console.error('Failed to start bot:', error);
   process.exitCode = 1;
 });
