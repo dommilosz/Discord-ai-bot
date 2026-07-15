@@ -202,6 +202,144 @@ const PLANNING_TOOLS = [
 ];
 
 // ──────────────────────────────────────────────────────────────────────────────
+// Read-only query tools (answers questions about current server state)
+// ──────────────────────────────────────────────────────────────────────────────
+
+const QUERY_TOOLS = [
+  {
+    type: 'function',
+    function: {
+      name: 'query_channel_access',
+      description:
+        'Check who can and cannot view a specific channel right now. Returns a breakdown by @everyone, each role with an overwrite, and individual members.',
+      parameters: {
+        type: 'object',
+        properties: {
+          channel_name: { type: 'string', description: 'Channel name (without #)' },
+        },
+        required: ['channel_name'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'query_role_permissions',
+      description:
+        'Show all Discord permissions a role grants plus metadata (color, hoist, mentionable, member count).',
+      parameters: {
+        type: 'object',
+        properties: {
+          role_name: { type: 'string', description: 'Role name (without @)' },
+        },
+        required: ['role_name'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'query_role_members',
+      description: 'List which members currently have a specific role.',
+      parameters: {
+        type: 'object',
+        properties: {
+          role_name: { type: 'string', description: 'Role name' },
+        },
+        required: ['role_name'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'query_channels_for_subject',
+      description:
+        'List which channels a role or @everyone can and cannot view, based on current permission overwrites.',
+      parameters: {
+        type: 'object',
+        properties: {
+          subject: {
+            type: 'string',
+            description: 'A role name or the string "@everyone"',
+          },
+        },
+        required: ['subject'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'query_member_access',
+      description:
+        'Check what a specific member can access — optionally for one channel, or list all channels they can and cannot view.',
+      parameters: {
+        type: 'object',
+        properties: {
+          username: { type: 'string', description: 'Member display name, username, or @mention' },
+          channel_name: {
+            type: 'string',
+            description: 'Optional: check access to this specific channel only',
+          },
+        },
+        required: ['username'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'query_member_roles',
+      description: 'List all roles a specific member currently holds.',
+      parameters: {
+        type: 'object',
+        properties: {
+          username: { type: 'string', description: 'Member display name or username' },
+        },
+        required: ['username'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'query_all_channels',
+      description:
+        'List every channel in the server with a public (🌐) or restricted (🔒) access indicator.',
+      parameters: {
+        type: 'object',
+        properties: {},
+        required: [],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'query_all_roles',
+      description: 'List all roles with their key permissions and member counts.',
+      parameters: {
+        type: 'object',
+        properties: {},
+        required: [],
+      },
+    },
+  },
+];
+
+/** Names of planning tools — used to route tool calls to the right handler. */
+const PLANNING_TOOL_NAMES = new Set([
+  'create_role',
+  'create_channel',
+  'assign_role',
+  'remove_role',
+  'set_channel_access',
+  'delete_channel',
+  'delete_role',
+]);
+
+// ──────────────────────────────────────────────────────────────────────────────
 // Tool call → PlannedAction conversion
 // ──────────────────────────────────────────────────────────────────────────────
 
@@ -470,5 +608,123 @@ export async function createRefinedPlan(
   return {
     summary: summary || `Apply ${actions.length} change(s) to ${context.guildName}.`,
     actions,
+  };
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Unified prompt processing — handles both queries and planning in one AI call
+// ──────────────────────────────────────────────────────────────────────────────
+
+const UNIFIED_SYSTEM_PROMPT = [
+  'You are a Discord guild administration assistant.',
+  'You have two types of tools available:',
+  '  1. QUERY tools (prefix "query_"): read-only — inspect the current server state and return real data.',
+  '  2. PLANNING tools (no prefix): schedule admin changes — create/delete channels, roles, assign roles, etc.',
+  'Decide which type to use based on the user request:',
+  '  - If the user is ASKING A QUESTION about current settings (who can see a channel, what permissions a role has, which channels @everyone can access, etc.), use query tools then answer clearly in plain text.',
+  '  - If the user wants to MAKE CHANGES, use planning tools. Each planning tool call becomes one action in the plan.',
+  '  - You may mix both: e.g. query the current access, then plan changes.',
+  'After all tool calls, write a concise response:',
+  '  - For queries: a clear, direct answer with the fetched data.',
+  '  - For plans: a one-sentence summary of what will be changed (the UI shows the full action list).',
+].join(' ');
+
+export type PromptResult =
+  | { kind: 'query'; answer: string }
+  | { kind: 'plan'; plan: BotPlan };
+
+/**
+ * Process any /admin prompt — automatically routes to query mode or planning
+ * mode based on what tools the AI calls.
+ *
+ * @param dispatchQueryTool - Callback that executes a named query tool against
+ *   the live guild and returns the result string. Kept as a callback so this
+ *   module stays free of discord.js imports.
+ */
+export async function processPrompt(
+  config: BotConfig,
+  context: PlannerContext,
+  dispatchQueryTool: (name: string, args: Record<string, unknown>) => Promise<string>,
+): Promise<PromptResult> {
+  const userContent = JSON.stringify({
+    guildName: context.guildName,
+    request: context.prompt,
+    existingChannels: context.existingChannels,
+    existingRoles: context.existingRoles,
+    knownMembers: context.memberSample,
+  });
+
+  const messages: ChatMessage[] = [
+    { role: 'system', content: UNIFIED_SYSTEM_PROMPT },
+    { role: 'user', content: userContent },
+  ];
+
+  const allTools = [...PLANNING_TOOLS, ...QUERY_TOOLS];
+  const actions: PlannedAction[] = [];
+  let finalText = '';
+  const MAX_ITERATIONS = 20;
+
+  for (let i = 0; i < MAX_ITERATIONS; i++) {
+    const message = await chatCompletions(config, messages, allTools);
+
+    messages.push({
+      role: 'assistant',
+      content: message.content ?? null,
+      tool_calls: message.tool_calls,
+    });
+
+    const toolCalls = message.tool_calls ?? [];
+
+    if (toolCalls.length === 0) {
+      finalText = (message.content ?? '').trim();
+      break;
+    }
+
+    const toolResults: ToolResultMessage[] = [];
+
+    for (const call of toolCalls) {
+      let args: Record<string, unknown> = {};
+      try {
+        args = JSON.parse(call.function.arguments) as Record<string, unknown>;
+      } catch {
+        // malformed JSON — skip
+      }
+
+      let resultContent: string;
+
+      if (PLANNING_TOOL_NAMES.has(call.function.name)) {
+        // Planning tool — accumulate action, acknowledge
+        const action = toolCallToAction(call.function.name, args);
+        if (action) actions.push(action);
+        resultContent = JSON.stringify({ result: 'noted' });
+      } else {
+        // Query tool — execute against live guild, return real data
+        resultContent = await dispatchQueryTool(call.function.name, args);
+      }
+
+      toolResults.push({
+        role: 'tool',
+        tool_call_id: call.id,
+        content: resultContent,
+      });
+    }
+
+    messages.push(...toolResults);
+  }
+
+  // If the AI called any planning tools it's a plan; otherwise it's a query answer
+  if (actions.length > 0) {
+    return {
+      kind: 'plan',
+      plan: {
+        summary: finalText || `Apply ${actions.length} change(s) to ${context.guildName}.`,
+        actions,
+      },
+    };
+  }
+
+  return {
+    kind: 'query',
+    answer: finalText || 'I could not determine an answer from the current server data.',
   };
 }

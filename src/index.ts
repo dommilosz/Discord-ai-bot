@@ -17,9 +17,10 @@ import {
   type GuildMember,
 } from 'discord.js';
 import { loadConfig } from './config';
-import { createPlan, createRefinedPlan } from './ai';
+import { processPrompt, createRefinedPlan } from './ai';
 import { formatPlan, BotPlan } from './plan';
 import { executeActions } from './executor';
+import { dispatchQueryTool } from './query';
 
 const config = loadConfig();
 
@@ -211,27 +212,42 @@ async function handleAdmin(interaction: ChatInputCommandInteraction): Promise<vo
 
   await interaction.deferReply({ ephemeral: true });
 
+  // Pre-fetch members so name-based lookups work in query mode
   try {
     await guild.members.fetch();
   } catch {
-    // Partial member cache is acceptable
+    // Partial cache is acceptable
   }
 
-  let plan: BotPlan;
+  const guildContext = {
+    guildName: guild.name,
+    prompt,
+    existingChannels: guildChannelList(guild),
+    existingRoles: guildRoleList(guild),
+    memberSample: guildMemberSample(guild),
+  };
 
+  let result;
   try {
-    plan = await createPlan(config, {
-      guildName: guild.name,
-      prompt,
-      existingChannels: guildChannelList(guild),
-      existingRoles: guildRoleList(guild),
-      memberSample: guildMemberSample(guild),
-    });
+    result = await processPrompt(
+      config,
+      guildContext,
+      (name, args) => dispatchQueryTool(guild, name, args),
+    );
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    await interaction.editReply(`❌ Failed to generate a plan: ${message}`);
+    await interaction.editReply(`❌ ${message}`);
     return;
   }
+
+  // ── Query answer ───────────────────────────────────────────────────────────
+  if (result.kind === 'query') {
+    await interaction.editReply(truncate(result.answer));
+    return;
+  }
+
+  // ── Plan ───────────────────────────────────────────────────────────────────
+  const { plan } = result;
 
   if (executeImmediately) {
     const results = await executeActions(guild, plan.actions, interaction.user.tag);
@@ -240,7 +256,6 @@ async function handleAdmin(interaction: ChatInputCommandInteraction): Promise<vo
     return;
   }
 
-  // Store plan and the interaction token so refinements can update this message
   const planId = crypto.randomUUID();
   pendingPlans.set(planId, {
     plan,
@@ -330,6 +345,7 @@ async function handleList(interaction: ChatInputCommandInteraction): Promise<voi
 
 async function handleHelp(interaction: ChatInputCommandInteraction): Promise<void> {
   const examples = [
+    '**Making changes:**',
     '`Create a #general channel (public) and a #staff channel (admins only)`',
     '`Create a Moderator role with manage_messages, kick_members, mute_members`',
     '`Create a Moderator role and assign it to @alice and @bob`',
@@ -338,6 +354,14 @@ async function handleHelp(interaction: ChatInputCommandInteraction): Promise<voi
     '`Make #general public and #admin-chat admin-only`',
     '`Remove the Moderator role from @charlie`',
     '`Delete the old-bots channel`',
+    '',
+    '**Asking questions (no changes made):**',
+    '`Would @everyone have access to #staff?`',
+    '`Which channels can the Moderator role see?`',
+    '`What permissions does the Moderator role have?`',
+    '`Can alice see the #admin-chat channel?`',
+    '`Who has the Moderator role?`',
+    '`Show me all channels and whether they are public or private`',
   ].join('\n');
 
   const configNote =
@@ -350,8 +374,8 @@ async function handleHelp(interaction: ChatInputCommandInteraction): Promise<voi
     'Use natural language to manage channels, roles, and permissions.',
     '',
     '**Commands**',
-    '• `/admin prompt:<text>` — AI generates a plan you can review, refine, and execute',
-    '• `/admin prompt:<text> execute:true` — execute immediately without preview',
+    '• `/admin prompt:<text>` — ask a question OR request changes; the bot auto-detects which',
+    '• `/admin prompt:<text> execute:true` — execute a change plan immediately without preview',
     '• `/admin-list` — show all channels and roles',
     '• `/admin-help` — show this message',
     '',
