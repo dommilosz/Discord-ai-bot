@@ -66,36 +66,88 @@ export type BotPlan = z.infer<typeof planSchema>;
 // Plan formatting
 // ──────────────────────────────────────────────────────────────────────────────
 
-export function formatPlan(plan: BotPlan): string {
-  const actionLines = plan.actions.map((action, index) => `${index + 1}. ${describeAction(action)}`);
-
-  return [`**Summary:** ${plan.summary}`, '', '**Actions:**', ...actionLines].join('\n');
+/** Emoji prefix for each action type shown in the plan preview. */
+function actionEmoji(action: PlannedAction): string {
+  switch (action.type) {
+    case 'create_role':    return '🎭';
+    case 'create_channel': return action.channelType === 'voice' ? '🔊' : action.channelType === 'category' ? '📁' : '💬';
+    case 'assign_role':    return '👤';
+    case 'remove_role':    return '👤';
+    case 'set_channel_access': return '🔒';
+    case 'delete_channel': return '🗑️';
+    case 'delete_role':    return '🗑️';
+  }
 }
 
 function describeAction(action: PlannedAction): string {
   switch (action.type) {
     case 'create_role': {
-      const perms = action.permissions?.length ? action.permissions.join(', ') : 'no extra permissions';
-      const color = action.color ? ` • color: ${action.color}` : '';
-      return `Create role **@${action.name}** (${perms}${color})`;
+      const perms = action.permissions?.length
+        ? `permissions: \`${action.permissions.join('`, `')}\``
+        : 'no extra permissions';
+      const extras: string[] = [perms];
+      if (action.color) extras.push(`color: ${action.color}`);
+      if (action.hoist === false) extras.push('not hoisted');
+      if (action.mentionable) extras.push('@mentionable');
+      return `Create role **@${action.name}** — ${extras.join(' • ')}`;
     }
+
     case 'create_channel': {
-      const access = action.private ? '🔒 private' : '🌐 public';
-      const allowed = action.allowedRoles?.length ? ` • visible to: ${action.allowedRoles.join(', ')}` : '';
-      const denied = action.deniedRoles?.length ? ` • hidden from: ${action.deniedRoles.join(', ')}` : '';
-      const limit = action.userLimit ? ` • limit: ${action.userLimit}` : '';
-      const category = action.category ? ` in **${action.category}**` : '';
-      return `Create ${action.channelType} channel **#${action.name}**${category} [${access}${allowed}${denied}${limit}]`;
+      const typeLabel = { text: 'text channel', voice: 'voice channel', category: 'category' }[action.channelType];
+      const parts: string[] = [];
+      if (action.private) {
+        parts.push('🔒 private');
+        if (action.allowedRoles?.length) parts.push(`visible to: ${action.allowedRoles.map((r) => `@${r}`).join(', ')}`);
+      } else {
+        parts.push('🌐 public');
+      }
+      if (action.deniedRoles?.length) parts.push(`hidden from: ${action.deniedRoles.map((r) => `@${r}`).join(', ')}`);
+      if (action.userLimit) parts.push(`limit: ${action.userLimit} users`);
+      if (action.topic) parts.push(`topic: "${action.topic}"`);
+      const location = action.category ? ` in **${action.category}**` : '';
+      return `Create ${typeLabel} **#${action.name}**${location} [${parts.join(' • ')}]`;
     }
+
     case 'assign_role':
-      return `Assign **@${action.role}** → ${action.users.join(', ')}`;
+      return `Give **@${action.role}** to: ${action.users.join(', ')}`;
+
     case 'remove_role':
-      return `Remove **@${action.role}** from ${action.users.join(', ')}`;
-    case 'set_channel_access':
-      return `Update access for **#${action.channel}**`;
+      return `Remove **@${action.role}** from: ${action.users.join(', ')}`;
+
+    case 'set_channel_access': {
+      const parts: string[] = [];
+      if (action.everyone === 'allow') parts.push('make public');
+      if (action.everyone === 'deny') parts.push('hide from everyone');
+      if (action.allowedRoles?.length) parts.push(`allow: ${action.allowedRoles.map((r) => `@${r}`).join(', ')}`);
+      if (action.deniedRoles?.length) parts.push(`deny: ${action.deniedRoles.map((r) => `@${r}`).join(', ')}`);
+      return `Update **#${action.channel}** access — ${parts.join(' • ') || 'no change'}`;
+    }
+
     case 'delete_channel':
-      return `Delete channel **#${action.name}** ⚠️`;
+      return `⚠️ Delete channel **#${action.name}** (permanent)`;
+
     case 'delete_role':
-      return `Delete role **@${action.name}** ⚠️`;
+      return `⚠️ Delete role **@${action.name}** (permanent)`;
   }
+}
+
+/**
+ * Render a plan as a Discord-formatted string ready to send as a message.
+ * Optionally annotates it as a refined version.
+ */
+export function formatPlan(plan: BotPlan, refinedFrom?: string): string {
+  const header = refinedFrom
+    ? `> ♻️ **Refined plan** *(follow-up: "${refinedFrom}")*`
+    : '> 📋 **Pending plan — review before applying**';
+
+  const summary = `> ${plan.summary}`;
+
+  const actionCount = `**${plan.actions.length} change${plan.actions.length === 1 ? '' : 's'} will be made:**`;
+
+  const actionLines = plan.actions.map((action, i) => {
+    const emoji = actionEmoji(action);
+    return `\`${i + 1}.\` ${emoji} ${describeAction(action)}`;
+  });
+
+  return [header, summary, '', actionCount, ...actionLines].join('\n');
 }

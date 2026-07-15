@@ -1,5 +1,5 @@
 import { BotConfig } from './config';
-import { BotPlan, PlannedAction } from './plan';
+import { BotPlan, PlannedAction, formatPlan } from './plan';
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Raw API types
@@ -347,20 +347,10 @@ const SYSTEM_PROMPT = [
   'Do not explain the individual actions; just write a high-level summary sentence.',
 ].join(' ');
 
-export async function createPlan(config: BotConfig, context: PlannerContext): Promise<BotPlan> {
-  const userContent = JSON.stringify({
-    guildName: context.guildName,
-    request: context.prompt,
-    existingChannels: context.existingChannels,
-    existingRoles: context.existingRoles,
-    knownMembers: context.memberSample,
-  });
-
-  const messages: ChatMessage[] = [
-    { role: 'system', content: SYSTEM_PROMPT },
-    { role: 'user', content: userContent },
-  ];
-
+async function runPlanningLoop(
+  config: BotConfig,
+  messages: ChatMessage[],
+): Promise<{ actions: PlannedAction[]; summary: string }> {
   const actions: PlannedAction[] = [];
   let summary = '';
   const MAX_ITERATIONS = 15;
@@ -368,7 +358,6 @@ export async function createPlan(config: BotConfig, context: PlannerContext): Pr
   for (let i = 0; i < MAX_ITERATIONS; i++) {
     const message = await chatCompletions(config, messages, PLANNING_TOOLS);
 
-    // Append assistant message for conversation history
     messages.push({
       role: 'assistant',
       content: message.content ?? null,
@@ -378,12 +367,10 @@ export async function createPlan(config: BotConfig, context: PlannerContext): Pr
     const toolCalls = message.tool_calls ?? [];
 
     if (toolCalls.length === 0) {
-      // AI finished planning; its text content is the summary
       summary = (message.content ?? '').trim();
       break;
     }
 
-    // Collect actions from tool calls and acknowledge each one
     const toolResults: ToolResultMessage[] = [];
 
     for (const call of toolCalls) {
@@ -409,13 +396,79 @@ export async function createPlan(config: BotConfig, context: PlannerContext): Pr
     messages.push(...toolResults);
   }
 
+  return { actions, summary };
+}
+
+export async function createPlan(config: BotConfig, context: PlannerContext): Promise<BotPlan> {
+  const userContent = JSON.stringify({
+    guildName: context.guildName,
+    request: context.prompt,
+    existingChannels: context.existingChannels,
+    existingRoles: context.existingRoles,
+    knownMembers: context.memberSample,
+  });
+
+  const messages: ChatMessage[] = [
+    { role: 'system', content: SYSTEM_PROMPT },
+    { role: 'user', content: userContent },
+  ];
+
+  const { actions, summary } = await runPlanningLoop(config, messages);
+
   if (actions.length === 0) {
     throw new Error('The AI did not produce any planned actions for that request.');
   }
 
-  if (!summary) {
-    summary = `Apply ${actions.length} change(s) to ${context.guildName}.`;
+  return {
+    summary: summary || `Apply ${actions.length} change(s) to ${context.guildName}.`,
+    actions,
+  };
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Refinement — re-plan with a follow-up prompt layered on top of an existing plan
+// ──────────────────────────────────────────────────────────────────────────────
+
+const REFINEMENT_SYSTEM_PROMPT = [
+  'You are updating a previously planned set of Discord admin actions.',
+  'You will be shown the original request, the current plan, and a follow-up refinement request.',
+  'Produce a COMPLETE updated plan: keep unchanged actions, and add / remove / modify as the follow-up requests.',
+  'Call the same planning tools as before — one call per action in the final plan.',
+  'After calling all tools, write a short plain-text summary of what the complete updated plan does.',
+].join(' ');
+
+export interface RefinementContext extends PlannerContext {
+  currentPlan: BotPlan;
+  followupPrompt: string;
+}
+
+export async function createRefinedPlan(
+  config: BotConfig,
+  context: RefinementContext,
+): Promise<BotPlan> {
+  const userContent = JSON.stringify({
+    guildName: context.guildName,
+    originalRequest: context.prompt,
+    currentPlan: formatPlan(context.currentPlan),
+    followupRequest: context.followupPrompt,
+    existingChannels: context.existingChannels,
+    existingRoles: context.existingRoles,
+    knownMembers: context.memberSample,
+  });
+
+  const messages: ChatMessage[] = [
+    { role: 'system', content: REFINEMENT_SYSTEM_PROMPT },
+    { role: 'user', content: userContent },
+  ];
+
+  const { actions, summary } = await runPlanningLoop(config, messages);
+
+  if (actions.length === 0) {
+    throw new Error('The AI did not produce any actions for the refined plan.');
   }
 
-  return { summary, actions };
+  return {
+    summary: summary || `Apply ${actions.length} change(s) to ${context.guildName}.`,
+    actions,
+  };
 }

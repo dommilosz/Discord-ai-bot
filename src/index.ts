@@ -5,16 +5,19 @@ import {
   ChannelType,
   Client,
   GatewayIntentBits,
+  ModalBuilder,
   PermissionsBitField,
   REST,
   Routes,
   SlashCommandBuilder,
+  TextInputBuilder,
+  TextInputStyle,
   type ChatInputCommandInteraction,
   type Guild,
   type GuildMember,
 } from 'discord.js';
 import { loadConfig } from './config';
-import { createPlan } from './ai';
+import { createPlan, createRefinedPlan } from './ai';
 import { formatPlan, BotPlan } from './plan';
 import { executeActions } from './executor';
 
@@ -33,6 +36,14 @@ interface PendingPlan {
   userId: string;
   guildId: string;
   expiresAt: number;
+  /** Original /admin prompt, kept so refinement has full context. */
+  originalPrompt: string;
+  /**
+   * The interaction token from the original /admin deferReply.
+   * Used to edit the plan preview message when the user refines it.
+   * Discord interaction tokens are valid for 15 minutes.
+   */
+  interactionToken: string;
 }
 
 const pendingPlans = new Map<string, PendingPlan>();
@@ -55,9 +66,7 @@ const adminCommand = new SlashCommandBuilder()
   .addStringOption((opt) =>
     opt
       .setName('prompt')
-      .setDescription(
-        'Describe what you want, e.g. "create a Moderator role and give it to @alice"',
-      )
+      .setDescription('Describe what you want, e.g. "create a Moderator role and give it to @alice"')
       .setRequired(true),
   )
   .addBooleanOption((opt) =>
@@ -98,14 +107,8 @@ async function registerCommands(): Promise<void> {
 // ──────────────────────────────────────────────────────────────────────────────
 
 function canUseBot(member: GuildMember): boolean {
-  if (member.permissions.has(PermissionsBitField.Flags.Administrator)) {
-    return true;
-  }
-
-  if (config.adminRoleIds.length === 0) {
-    return false;
-  }
-
+  if (member.permissions.has(PermissionsBitField.Flags.Administrator)) return true;
+  if (config.adminRoleIds.length === 0) return false;
   return config.adminRoleIds.some((id) => member.roles.cache.has(id));
 }
 
@@ -128,9 +131,57 @@ function guildRoleList(guild: Guild): string[] {
 }
 
 function guildMemberSample(guild: Guild): string[] {
-  return guild.members.cache
-    .map((m) => m.displayName)
-    .slice(0, 30);
+  return guild.members.cache.map((m) => m.displayName).slice(0, 30);
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// UI helpers
+// ──────────────────────────────────────────────────────────────────────────────
+
+function buildPlanButtons(planId: string): ActionRowBuilder<ButtonBuilder> {
+  return new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`admin:confirm:${planId}`)
+      .setLabel('Execute')
+      .setStyle(ButtonStyle.Success)
+      .setEmoji('✅'),
+    new ButtonBuilder()
+      .setCustomId(`admin:refine:${planId}`)
+      .setLabel('Refine')
+      .setStyle(ButtonStyle.Primary)
+      .setEmoji('✏️'),
+    new ButtonBuilder()
+      .setCustomId(`admin:cancel:${planId}`)
+      .setLabel('Cancel')
+      .setStyle(ButtonStyle.Danger)
+      .setEmoji('❌'),
+  );
+}
+
+function planMessage(plan: BotPlan, refinedFrom?: string): string {
+  return (
+    formatPlan(plan, refinedFrom) +
+    '\n\n> Click **Execute** to apply, **Refine** to adjust, or **Cancel** to discard.'
+  );
+}
+
+/** Patch the original /admin reply via stored interaction token. */
+async function updateOriginalPlanMessage(
+  interactionToken: string,
+  content: string,
+  row?: ActionRowBuilder<ButtonBuilder>,
+): Promise<void> {
+  await client.rest.patch(Routes.webhookMessage(config.clientId, interactionToken), {
+    body: {
+      content,
+      components: row ? [row.toJSON()] : [],
+    },
+  });
+}
+
+function truncate(text: string, maxLength = 1990): string {
+  if (text.length <= maxLength) return text;
+  return text.slice(0, maxLength - 3) + '...';
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -158,14 +209,12 @@ async function handleAdmin(interaction: ChatInputCommandInteraction): Promise<vo
   const prompt = interaction.options.getString('prompt', true);
   const executeImmediately = interaction.options.getBoolean('execute') ?? false;
 
-  // Defer so we have time to call the AI
   await interaction.deferReply({ ephemeral: true });
 
-  // Fetch members so we can resolve them by name
   try {
     await guild.members.fetch();
   } catch {
-    // Partial member cache is fine; we will search later
+    // Partial member cache is acceptable
   }
 
   let plan: BotPlan;
@@ -184,41 +233,27 @@ async function handleAdmin(interaction: ChatInputCommandInteraction): Promise<vo
     return;
   }
 
-  const preview = formatPlan(plan);
-
   if (executeImmediately) {
     const results = await executeActions(guild, plan.actions, interaction.user.tag);
-    const body = [`${preview}`, '', '**Execution results:**', ...results].join('\n');
+    const body = [formatPlan(plan), '', '**Execution results:**', ...results].join('\n');
     await interaction.editReply(truncate(body));
     return;
   }
 
-  // Store plan for button confirmation (expires in 10 minutes)
+  // Store plan and the interaction token so refinements can update this message
   const planId = crypto.randomUUID();
   pendingPlans.set(planId, {
     plan,
     userId: interaction.user.id,
     guildId: guild.id,
     expiresAt: Date.now() + 10 * 60_000,
+    originalPrompt: prompt,
+    interactionToken: interaction.token,
   });
 
-  const confirmBtn = new ButtonBuilder()
-    .setCustomId(`admin:confirm:${planId}`)
-    .setLabel('Execute')
-    .setStyle(ButtonStyle.Success)
-    .setEmoji('✅');
-
-  const cancelBtn = new ButtonBuilder()
-    .setCustomId(`admin:cancel:${planId}`)
-    .setLabel('Cancel')
-    .setStyle(ButtonStyle.Danger)
-    .setEmoji('❌');
-
-  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(confirmBtn, cancelBtn);
-
   await interaction.editReply({
-    content: `${preview}\n\nConfirm to apply these changes, or cancel to discard.`,
-    components: [row],
+    content: truncate(planMessage(plan)),
+    components: [buildPlanButtons(planId)],
   });
 }
 
@@ -242,7 +277,6 @@ async function handleList(interaction: ChatInputCommandInteraction): Promise<voi
 
   const lines: string[] = ['**Channels**'];
 
-  // Categories + their children
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const pos = (c: any): number => (c as { position?: number }).position ?? 0;
 
@@ -261,7 +295,6 @@ async function handleList(interaction: ChatInputCommandInteraction): Promise<voi
     }
   }
 
-  // Uncategorised channels
   const uncategorised = guild.channels.cache.filter(
     (c) =>
       c.parentId === null &&
@@ -275,17 +308,16 @@ async function handleList(interaction: ChatInputCommandInteraction): Promise<voi
     }
   }
 
-  // Roles
   lines.push('\n**Roles**');
   const roles = guild.roles.cache
     .filter((r) => r.id !== guild.id)
     .sort((a, b) => b.rawPosition - a.rawPosition);
 
   for (const role of roles.values()) {
-    const perms: string[] = [];
-    if (role.permissions.has(PermissionsBitField.Flags.Administrator)) perms.push('Admin');
-    else if (role.permissions.has(PermissionsBitField.Flags.ManageMessages)) perms.push('Mod');
-    const suffix = perms.length ? ` *(${perms.join(', ')})*` : '';
+    const tags: string[] = [];
+    if (role.permissions.has(PermissionsBitField.Flags.Administrator)) tags.push('Admin');
+    else if (role.permissions.has(PermissionsBitField.Flags.ManageMessages)) tags.push('Mod');
+    const suffix = tags.length ? ` *(${tags.join(', ')})*` : '';
     lines.push(`🏷️ @${role.name}${suffix}`);
   }
 
@@ -297,12 +329,12 @@ async function handleList(interaction: ChatInputCommandInteraction): Promise<voi
 // ──────────────────────────────────────────────────────────────────────────────
 
 async function handleHelp(interaction: ChatInputCommandInteraction): Promise<void> {
-  const examplePrompts = [
+  const examples = [
     '`Create a #general channel (public) and a #staff channel (admins only)`',
     '`Create a Moderator role with manage_messages, kick_members, mute_members`',
     '`Create a Moderator role and assign it to @alice and @bob`',
-    '`Create a Staff category. Inside it, add #staff-chat (private, Moderator only) and #announcements (private, Moderator only)`',
-    '`Create a voice channel called Gaming Lounge with a 10-user limit`',
+    '`Create a Staff category with #staff-chat and #announcements (Moderator only)`',
+    '`Create a voice channel Gaming Lounge with a 10-user limit`',
     '`Make #general public and #admin-chat admin-only`',
     '`Remove the Moderator role from @charlie`',
     '`Delete the old-bots channel`',
@@ -310,44 +342,34 @@ async function handleHelp(interaction: ChatInputCommandInteraction): Promise<voi
 
   const configNote =
     config.adminRoleIds.length > 0
-      ? `Configured bot-manager roles: ${config.adminRoleIds.length}`
-      : 'No bot-manager roles configured — only server Administrators can use this bot.';
+      ? `${config.adminRoleIds.length} bot-manager role(s) configured`
+      : 'No bot-manager roles configured — only server Administrators can use this bot';
 
   const content = [
     '## Discord Admin Bot',
-    'Use `/admin` with a natural language prompt to manage your server.',
-    '',
-    '**Who can use it**',
-    '• Server Administrators',
-    '• Members with a role listed in `ADMIN_ROLE_IDS`',
-    `*(${configNote})*`,
+    'Use natural language to manage channels, roles, and permissions.',
     '',
     '**Commands**',
-    '• `/admin prompt:<text>` — generate a plan; click **Execute** to apply it',
-    '• `/admin prompt:<text> execute:true` — apply changes immediately (no preview)',
+    '• `/admin prompt:<text>` — AI generates a plan you can review, refine, and execute',
+    '• `/admin prompt:<text> execute:true` — execute immediately without preview',
     '• `/admin-list` — show all channels and roles',
     '• `/admin-help` — show this message',
     '',
-    '**Example prompts**',
-    examplePrompts,
+    '**Plan review buttons**',
+    '• ✅ **Execute** — apply all planned changes',
+    '• ✏️ **Refine** — open a follow-up prompt to adjust the plan before applying',
+    '• ❌ **Cancel** — discard the plan, no changes made',
     '',
-    '**Supported actions**',
-    '• Create / delete text channels, voice channels, and categories',
-    '• Set channel visibility (public, admin-only, or role-specific)',
-    '• Create / delete roles with custom permissions and colors',
-    '• Assign / remove roles from users',
+    '**Who can use it**',
+    '• Server Administrators',
+    '• Members holding a role in `ADMIN_ROLE_IDS`',
+    `*(${configNote})*`,
+    '',
+    '**Example prompts**',
+    examples,
   ].join('\n');
 
   await interaction.reply({ content, ephemeral: true });
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Utility
-// ──────────────────────────────────────────────────────────────────────────────
-
-function truncate(text: string, maxLength = 1990): string {
-  if (text.length <= maxLength) return text;
-  return text.slice(0, maxLength - 3) + '...';
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -373,12 +395,18 @@ client.on('interactionCreate', async (interaction) => {
     const pending = planId ? pendingPlans.get(planId) : undefined;
 
     if (!pending) {
-      await interaction.update({ content: '⏰ This plan has expired. Run `/admin` again.', components: [] });
+      await interaction.update({
+        content: '⏰ This plan has expired. Run `/admin` again.',
+        components: [],
+      });
       return;
     }
 
     if (interaction.user.id !== pending.userId) {
-      await interaction.reply({ content: "You can't confirm another user's plan.", ephemeral: true });
+      await interaction.reply({
+        content: "You can't interact with another user's plan.",
+        ephemeral: true,
+      });
       return;
     }
 
@@ -387,24 +415,135 @@ client.on('interactionCreate', async (interaction) => {
       return;
     }
 
-    pendingPlans.delete(planId);
-
+    // ── Cancel ───────────────────────────────────────────────────────────────
     if (action === 'cancel') {
+      pendingPlans.delete(planId);
       await interaction.update({ content: '❌ Cancelled — no changes were made.', components: [] });
       return;
     }
 
+    // ── Execute ──────────────────────────────────────────────────────────────
     if (action === 'confirm') {
+      pendingPlans.delete(planId);
       await interaction.deferUpdate();
+
       const results = await executeActions(
         interaction.guild,
         pending.plan.actions,
         interaction.user.tag,
       );
-      const body = [formatPlan(pending.plan), '', '**Execution results:**', ...results].join('\n');
+
+      const body = [
+        formatPlan(pending.plan),
+        '',
+        '**Execution results:**',
+        ...results,
+      ].join('\n');
+
       await interaction.editReply({ content: truncate(body), components: [] });
+      return;
     }
 
+    // ── Refine — open modal ──────────────────────────────────────────────────
+    if (action === 'refine') {
+      const modal = new ModalBuilder()
+        .setCustomId(`admin:refine-modal:${planId}`)
+        .setTitle('Refine the plan');
+
+      const input = new TextInputBuilder()
+        .setCustomId('followup')
+        .setLabel('What would you like to change or add?')
+        .setStyle(TextInputStyle.Paragraph)
+        .setPlaceholder(
+          'e.g. "also add a #rules channel visible to everyone" or "remove the voice channel"',
+        )
+        .setMinLength(3)
+        .setMaxLength(1000)
+        .setRequired(true);
+
+      modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input));
+      await interaction.showModal(modal);
+      return;
+    }
+
+    return;
+  }
+
+  // ── Modal submissions ─────────────────────────────────────────────────────
+  if (interaction.isModalSubmit()) {
+    const parts = interaction.customId.split(':');
+    if (parts[0] !== 'admin' || parts[1] !== 'refine-modal') return;
+
+    const planId = parts[2];
+    const pending = planId ? pendingPlans.get(planId) : undefined;
+
+    if (!pending) {
+      await interaction.reply({
+        content: '⏰ The plan expired while the modal was open. Run `/admin` again.',
+        ephemeral: true,
+      });
+      return;
+    }
+
+    if (interaction.user.id !== pending.userId) {
+      await interaction.reply({
+        content: "You can't refine another user's plan.",
+        ephemeral: true,
+      });
+      return;
+    }
+
+    const followup = interaction.fields.getTextInputValue('followup');
+
+    // Acknowledge the modal immediately; refinement can take a few seconds
+    await interaction.deferReply({ ephemeral: true });
+
+    const guild = interaction.guild;
+    if (!guild) {
+      await interaction.editReply('❌ Could not access guild context.');
+      return;
+    }
+
+    let refinedPlan: BotPlan;
+
+    try {
+      refinedPlan = await createRefinedPlan(config, {
+        guildName: guild.name,
+        prompt: pending.originalPrompt,
+        existingChannels: guildChannelList(guild),
+        existingRoles: guildRoleList(guild),
+        memberSample: guildMemberSample(guild),
+        currentPlan: pending.plan,
+        followupPrompt: followup,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await interaction.editReply(`❌ Refinement failed: ${message}`);
+      return;
+    }
+
+    // Update the stored plan in-place and reset the expiry
+    pending.plan = refinedPlan;
+    pending.expiresAt = Date.now() + 10 * 60_000;
+
+    // Update the original /admin message with the refined plan
+    try {
+      await updateOriginalPlanMessage(
+        pending.interactionToken,
+        truncate(planMessage(refinedPlan, followup)),
+        buildPlanButtons(planId),
+      );
+    } catch {
+      // Token may have expired (> 15 min) — fall back to sending a new reply
+      await interaction.editReply({
+        content: truncate(planMessage(refinedPlan, followup)),
+        components: [buildPlanButtons(planId)],
+      });
+      return;
+    }
+
+    // Dismiss the modal's deferred reply silently
+    await interaction.deleteReply();
     return;
   }
 
