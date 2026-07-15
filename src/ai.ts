@@ -1,58 +1,730 @@
 import { BotConfig } from './config';
-import { BotPlan, planSchema } from './plan';
+import { BotPlan, PlannedAction, formatPlan } from './plan';
 
-interface PlannerContext {
-  guildName: string;
-  prompt: string;
-  roleOptions: Array<{ id: string; name: string }>;
+// ──────────────────────────────────────────────────────────────────────────────
+// Raw API types
+// ──────────────────────────────────────────────────────────────────────────────
+
+interface ToolCall {
+  id: string;
+  type: 'function';
+  function: { name: string; arguments: string };
 }
 
-export async function createPlan(config: BotConfig, context: PlannerContext): Promise<BotPlan> {
-  const response = await fetch(`${config.aiBaseUrl.replace(/\/$/, '')}/chat/completions`, {
+interface SystemMessage {
+  role: 'system';
+  content: string;
+}
+
+interface UserMessage {
+  role: 'user';
+  content: string;
+}
+
+interface AssistantMessage {
+  role: 'assistant';
+  content: string | null;
+  tool_calls?: ToolCall[];
+}
+
+interface ToolResultMessage {
+  role: 'tool';
+  tool_call_id: string;
+  content: string;
+}
+
+type ChatMessage = SystemMessage | UserMessage | AssistantMessage | ToolResultMessage;
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Planning tools (each tool call from the AI becomes one planned action)
+// ──────────────────────────────────────────────────────────────────────────────
+
+const PLANNING_TOOLS = [
+  {
+    type: 'function',
+    function: {
+      name: 'create_role',
+      description:
+        'Plan creating a new Discord role with optional color, permissions, and display settings.',
+      parameters: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: 'Role name' },
+          color: { type: 'string', description: 'Hex color like #FF5733 (optional)' },
+          permissions: {
+            type: 'array',
+            items: { type: 'string' },
+            description:
+              'Permission names: administrator, manage_channels, manage_roles, manage_messages, kick_members, ban_members, mute_members, move_members, manage_nicknames, view_audit_log, manage_guild, mention_everyone, manage_webhooks, send_messages, connect, speak, deafen_members',
+          },
+          hoist: { type: 'boolean', description: 'Show separately in member list (default true)' },
+          mentionable: { type: 'boolean', description: 'Allow everyone to @mention this role' },
+        },
+        required: ['name'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'create_channel',
+      description:
+        'Plan creating a text, voice, or category channel. Set private:true and allowedRoles to restrict access.',
+      parameters: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: 'Channel name (use hyphens, not spaces for text/voice)' },
+          channelType: {
+            type: 'string',
+            enum: ['text', 'voice', 'category'],
+            description: 'Type of channel',
+          },
+          category: { type: 'string', description: 'Name of the parent category (optional)' },
+          topic: { type: 'string', description: 'Channel topic for text channels (optional)' },
+          private: {
+            type: 'boolean',
+            description: 'When true, @everyone cannot see this channel',
+          },
+          allowedRoles: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Role names granted view access when channel is private',
+          },
+          deniedRoles: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Role names explicitly denied view access',
+          },
+          userLimit: {
+            type: 'number',
+            description: 'Max users for voice channels (0 = unlimited)',
+          },
+        },
+        required: ['name', 'channelType'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'assign_role',
+      description: 'Plan assigning a role to one or more users.',
+      parameters: {
+        type: 'object',
+        properties: {
+          role: { type: 'string', description: 'Role name' },
+          users: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'User names, display names, or Discord mention strings like <@123456789>',
+          },
+        },
+        required: ['role', 'users'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'remove_role',
+      description: 'Plan removing a role from one or more users.',
+      parameters: {
+        type: 'object',
+        properties: {
+          role: { type: 'string', description: 'Role name' },
+          users: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'User names or display names',
+          },
+        },
+        required: ['role', 'users'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'set_channel_access',
+      description: 'Plan updating who can view an existing channel.',
+      parameters: {
+        type: 'object',
+        properties: {
+          channel: { type: 'string', description: 'Channel name' },
+          everyone: {
+            type: 'string',
+            enum: ['allow', 'deny'],
+            description: "Set @everyone's access: allow = public, deny = private",
+          },
+          allowedRoles: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Roles to grant view access',
+          },
+          deniedRoles: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Roles to deny view access',
+          },
+        },
+        required: ['channel'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'delete_channel',
+      description: 'Plan deleting an existing channel.',
+      parameters: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: 'Channel name to delete' },
+        },
+        required: ['name'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'delete_role',
+      description: 'Plan deleting an existing role.',
+      parameters: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: 'Role name to delete' },
+        },
+        required: ['name'],
+      },
+    },
+  },
+];
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Read-only query tools (answers questions about current server state)
+// ──────────────────────────────────────────────────────────────────────────────
+
+const QUERY_TOOLS = [
+  {
+    type: 'function',
+    function: {
+      name: 'query_channel_access',
+      description:
+        'Check who can and cannot view a specific channel right now. Returns a breakdown by @everyone, each role with an overwrite, and individual members.',
+      parameters: {
+        type: 'object',
+        properties: {
+          channel_name: { type: 'string', description: 'Channel name (without #)' },
+        },
+        required: ['channel_name'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'query_role_permissions',
+      description:
+        'Show all Discord permissions a role grants plus metadata (color, hoist, mentionable, member count).',
+      parameters: {
+        type: 'object',
+        properties: {
+          role_name: { type: 'string', description: 'Role name (without @)' },
+        },
+        required: ['role_name'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'query_role_members',
+      description: 'List which members currently have a specific role.',
+      parameters: {
+        type: 'object',
+        properties: {
+          role_name: { type: 'string', description: 'Role name' },
+        },
+        required: ['role_name'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'query_channels_for_subject',
+      description:
+        'List which channels a role or @everyone can and cannot view, based on current permission overwrites.',
+      parameters: {
+        type: 'object',
+        properties: {
+          subject: {
+            type: 'string',
+            description: 'A role name or the string "@everyone"',
+          },
+        },
+        required: ['subject'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'query_member_access',
+      description:
+        'Check what a specific member can access — optionally for one channel, or list all channels they can and cannot view.',
+      parameters: {
+        type: 'object',
+        properties: {
+          username: { type: 'string', description: 'Member display name, username, or @mention' },
+          channel_name: {
+            type: 'string',
+            description: 'Optional: check access to this specific channel only',
+          },
+        },
+        required: ['username'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'query_member_roles',
+      description: 'List all roles a specific member currently holds.',
+      parameters: {
+        type: 'object',
+        properties: {
+          username: { type: 'string', description: 'Member display name or username' },
+        },
+        required: ['username'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'query_all_channels',
+      description:
+        'List every channel in the server with a public (🌐) or restricted (🔒) access indicator.',
+      parameters: {
+        type: 'object',
+        properties: {},
+        required: [],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'query_all_roles',
+      description: 'List all roles with their key permissions and member counts.',
+      parameters: {
+        type: 'object',
+        properties: {},
+        required: [],
+      },
+    },
+  },
+];
+
+/** Names of planning tools — used to route tool calls to the right handler. */
+const PLANNING_TOOL_NAMES = new Set([
+  'create_role',
+  'create_channel',
+  'assign_role',
+  'remove_role',
+  'set_channel_access',
+  'delete_channel',
+  'delete_role',
+]);
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Tool call → PlannedAction conversion
+// ──────────────────────────────────────────────────────────────────────────────
+
+function toolCallToAction(name: string, args: Record<string, unknown>): PlannedAction | null {
+  switch (name) {
+    case 'create_role':
+      return {
+        type: 'create_role',
+        name: String(args.name ?? ''),
+        color: args.color ? String(args.color) : undefined,
+        permissions: Array.isArray(args.permissions)
+          ? (args.permissions as string[])
+          : undefined,
+        hoist: typeof args.hoist === 'boolean' ? args.hoist : undefined,
+        mentionable: typeof args.mentionable === 'boolean' ? args.mentionable : undefined,
+      };
+
+    case 'create_channel':
+      return {
+        type: 'create_channel',
+        name: String(args.name ?? ''),
+        channelType: (args.channelType as 'text' | 'voice' | 'category') ?? 'text',
+        category: args.category ? String(args.category) : undefined,
+        topic: args.topic ? String(args.topic) : undefined,
+        private: typeof args.private === 'boolean' ? args.private : undefined,
+        allowedRoles: Array.isArray(args.allowedRoles)
+          ? (args.allowedRoles as string[])
+          : undefined,
+        deniedRoles: Array.isArray(args.deniedRoles)
+          ? (args.deniedRoles as string[])
+          : undefined,
+        userLimit: typeof args.userLimit === 'number' ? args.userLimit : undefined,
+      };
+
+    case 'assign_role':
+      return {
+        type: 'assign_role',
+        role: String(args.role ?? ''),
+        users: Array.isArray(args.users) ? (args.users as string[]) : [],
+      };
+
+    case 'remove_role':
+      return {
+        type: 'remove_role',
+        role: String(args.role ?? ''),
+        users: Array.isArray(args.users) ? (args.users as string[]) : [],
+      };
+
+    case 'set_channel_access':
+      return {
+        type: 'set_channel_access',
+        channel: String(args.channel ?? ''),
+        everyone: args.everyone as 'allow' | 'deny' | undefined,
+        allowedRoles: Array.isArray(args.allowedRoles)
+          ? (args.allowedRoles as string[])
+          : undefined,
+        deniedRoles: Array.isArray(args.deniedRoles)
+          ? (args.deniedRoles as string[])
+          : undefined,
+      };
+
+    case 'delete_channel':
+      return { type: 'delete_channel', name: String(args.name ?? '') };
+
+    case 'delete_role':
+      return { type: 'delete_role', name: String(args.name ?? '') };
+
+    default:
+      return null;
+  }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// API helpers
+// ──────────────────────────────────────────────────────────────────────────────
+
+async function chatCompletions(
+  config: BotConfig,
+  messages: ChatMessage[],
+  tools?: unknown[],
+): Promise<AssistantMessage> {
+  const url = `${config.aiBaseUrl.replace(/\/$/, '')}/chat/completions`;
+
+  const body: Record<string, unknown> = {
+    model: config.aiModel,
+    temperature: 0.2,
+    messages,
+  };
+
+  if (tools?.length) {
+    body.tools = tools;
+    body.tool_choice = 'auto';
+  }
+
+  const response = await fetch(url, {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${config.aiApiKey}`,
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({
-      model: config.aiModel,
-      temperature: 0.2,
-      response_format: { type: 'json_object' },
-      messages: [
-        {
-          role: 'system',
-          content: [
-            'You are a Discord guild automation planner.',
-            'Return only JSON that matches this shape: { summary: string, assumptions: string[], actions: [...] }.',
-            'Only use the allowed action types: create_role, create_channel, assign_role, set_channel_access.',
-            'Prefer explicit role and user identifiers when available.',
-            'If the prompt is ambiguous, make conservative assumptions and list them in assumptions.',
-            'Do not include markdown or extra commentary.',
-          ].join(' '),
-        },
-        {
-          role: 'user',
-          content: JSON.stringify({
-            guildName: context.guildName,
-            prompt: context.prompt,
-            availableRoles: context.roleOptions,
-          }),
-        },
-      ],
-    }),
+    body: JSON.stringify(body),
   });
 
   if (!response.ok) {
-    throw new Error(`AI request failed with status ${response.status}`);
+    const text = await response.text().catch(() => '');
+    throw new Error(`AI API error ${response.status}: ${text}`);
   }
 
-  const payload = (await response.json()) as { choices?: Array<{ message?: { content?: string } }> };
-  const content = payload.choices?.[0]?.message?.content;
+  const payload = (await response.json()) as {
+    choices?: Array<{ message?: AssistantMessage }>;
+  };
 
-  if (!content) {
-    throw new Error('AI response did not include a plan');
+  const message = payload.choices?.[0]?.message;
+
+  if (!message) {
+    throw new Error('AI response missing message');
   }
 
-  const parsed = JSON.parse(content) as unknown;
-  return planSchema.parse(parsed);
+  return message;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Public interface
+// ──────────────────────────────────────────────────────────────────────────────
+
+interface PlannerContext {
+  guildName: string;
+  prompt: string;
+  existingChannels: string[];
+  existingRoles: string[];
+  memberSample: string[];
+}
+
+const SYSTEM_PROMPT = [
+  'You are a Discord guild administration planner.',
+  'Call the planning tools to schedule each admin action the user requested.',
+  'You may call multiple tools — one call per action.',
+  "For a moderator role, include at least: manage_messages, kick_members, mute_members.",
+  "For an admin role, include: administrator.",
+  'When creating a private channel, set private:true and list roles in allowedRoles.',
+  'Channel names must use hyphens instead of spaces.',
+  'After you have called all necessary tools, produce a short plain-text summary of what will happen.',
+  'Do not explain the individual actions; just write a high-level summary sentence.',
+].join(' ');
+
+async function runPlanningLoop(
+  config: BotConfig,
+  messages: ChatMessage[],
+): Promise<{ actions: PlannedAction[]; summary: string }> {
+  const actions: PlannedAction[] = [];
+  let summary = '';
+  const MAX_ITERATIONS = 15;
+
+  for (let i = 0; i < MAX_ITERATIONS; i++) {
+    const message = await chatCompletions(config, messages, PLANNING_TOOLS);
+
+    messages.push({
+      role: 'assistant',
+      content: message.content ?? null,
+      tool_calls: message.tool_calls,
+    });
+
+    const toolCalls = message.tool_calls ?? [];
+
+    if (toolCalls.length === 0) {
+      summary = (message.content ?? '').trim();
+      break;
+    }
+
+    const toolResults: ToolResultMessage[] = [];
+
+    for (const call of toolCalls) {
+      let args: Record<string, unknown> = {};
+      try {
+        args = JSON.parse(call.function.arguments) as Record<string, unknown>;
+      } catch {
+        // malformed JSON — skip
+      }
+
+      const action = toolCallToAction(call.function.name, args);
+      if (action) {
+        actions.push(action);
+      }
+
+      toolResults.push({
+        role: 'tool',
+        tool_call_id: call.id,
+        content: JSON.stringify({ result: 'noted' }),
+      });
+    }
+
+    messages.push(...toolResults);
+  }
+
+  return { actions, summary };
+}
+
+export async function createPlan(config: BotConfig, context: PlannerContext): Promise<BotPlan> {
+  const userContent = JSON.stringify({
+    guildName: context.guildName,
+    request: context.prompt,
+    existingChannels: context.existingChannels,
+    existingRoles: context.existingRoles,
+    knownMembers: context.memberSample,
+  });
+
+  const messages: ChatMessage[] = [
+    { role: 'system', content: SYSTEM_PROMPT },
+    { role: 'user', content: userContent },
+  ];
+
+  const { actions, summary } = await runPlanningLoop(config, messages);
+
+  if (actions.length === 0) {
+    throw new Error('The AI did not produce any planned actions for that request.');
+  }
+
+  return {
+    summary: summary || `Apply ${actions.length} change(s) to ${context.guildName}.`,
+    actions,
+  };
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Refinement — re-plan with a follow-up prompt layered on top of an existing plan
+// ──────────────────────────────────────────────────────────────────────────────
+
+const REFINEMENT_SYSTEM_PROMPT = [
+  'You are updating a previously planned set of Discord admin actions.',
+  'You will be shown the original request, the current plan, and a follow-up refinement request.',
+  'Produce a COMPLETE updated plan: keep unchanged actions, and add / remove / modify as the follow-up requests.',
+  'Call the same planning tools as before — one call per action in the final plan.',
+  'After calling all tools, write a short plain-text summary of what the complete updated plan does.',
+].join(' ');
+
+export interface RefinementContext extends PlannerContext {
+  currentPlan: BotPlan;
+  followupPrompt: string;
+}
+
+export async function createRefinedPlan(
+  config: BotConfig,
+  context: RefinementContext,
+): Promise<BotPlan> {
+  const userContent = JSON.stringify({
+    guildName: context.guildName,
+    originalRequest: context.prompt,
+    currentPlan: formatPlan(context.currentPlan),
+    followupRequest: context.followupPrompt,
+    existingChannels: context.existingChannels,
+    existingRoles: context.existingRoles,
+    knownMembers: context.memberSample,
+  });
+
+  const messages: ChatMessage[] = [
+    { role: 'system', content: REFINEMENT_SYSTEM_PROMPT },
+    { role: 'user', content: userContent },
+  ];
+
+  const { actions, summary } = await runPlanningLoop(config, messages);
+
+  if (actions.length === 0) {
+    throw new Error('The AI did not produce any actions for the refined plan.');
+  }
+
+  return {
+    summary: summary || `Apply ${actions.length} change(s) to ${context.guildName}.`,
+    actions,
+  };
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Unified prompt processing — handles both queries and planning in one AI call
+// ──────────────────────────────────────────────────────────────────────────────
+
+const UNIFIED_SYSTEM_PROMPT = [
+  'You are a Discord guild administration assistant.',
+  'You have two types of tools available:',
+  '  1. QUERY tools (prefix "query_"): read-only — inspect the current server state and return real data.',
+  '  2. PLANNING tools (no prefix): schedule admin changes — create/delete channels, roles, assign roles, etc.',
+  'Decide which type to use based on the user request:',
+  '  - If the user is ASKING A QUESTION about current settings (who can see a channel, what permissions a role has, which channels @everyone can access, etc.), use query tools then answer clearly in plain text.',
+  '  - If the user wants to MAKE CHANGES, use planning tools. Each planning tool call becomes one action in the plan.',
+  '  - You may mix both: e.g. query the current access, then plan changes.',
+  'After all tool calls, write a concise response:',
+  '  - For queries: a clear, direct answer with the fetched data.',
+  '  - For plans: a one-sentence summary of what will be changed (the UI shows the full action list).',
+].join(' ');
+
+export type PromptResult =
+  | { kind: 'query'; answer: string }
+  | { kind: 'plan'; plan: BotPlan };
+
+/**
+ * Process any /admin prompt — automatically routes to query mode or planning
+ * mode based on what tools the AI calls.
+ *
+ * @param dispatchQueryTool - Callback that executes a named query tool against
+ *   the live guild and returns the result string. Kept as a callback so this
+ *   module stays free of discord.js imports.
+ */
+export async function processPrompt(
+  config: BotConfig,
+  context: PlannerContext,
+  dispatchQueryTool: (name: string, args: Record<string, unknown>) => Promise<string>,
+): Promise<PromptResult> {
+  const userContent = JSON.stringify({
+    guildName: context.guildName,
+    request: context.prompt,
+    existingChannels: context.existingChannels,
+    existingRoles: context.existingRoles,
+    knownMembers: context.memberSample,
+  });
+
+  const messages: ChatMessage[] = [
+    { role: 'system', content: UNIFIED_SYSTEM_PROMPT },
+    { role: 'user', content: userContent },
+  ];
+
+  const allTools = [...PLANNING_TOOLS, ...QUERY_TOOLS];
+  const actions: PlannedAction[] = [];
+  let finalText = '';
+  const MAX_ITERATIONS = 20;
+
+  for (let i = 0; i < MAX_ITERATIONS; i++) {
+    const message = await chatCompletions(config, messages, allTools);
+
+    messages.push({
+      role: 'assistant',
+      content: message.content ?? null,
+      tool_calls: message.tool_calls,
+    });
+
+    const toolCalls = message.tool_calls ?? [];
+
+    if (toolCalls.length === 0) {
+      finalText = (message.content ?? '').trim();
+      break;
+    }
+
+    const toolResults: ToolResultMessage[] = [];
+
+    for (const call of toolCalls) {
+      let args: Record<string, unknown> = {};
+      try {
+        args = JSON.parse(call.function.arguments) as Record<string, unknown>;
+      } catch {
+        // malformed JSON — skip
+      }
+
+      let resultContent: string;
+
+      if (PLANNING_TOOL_NAMES.has(call.function.name)) {
+        // Planning tool — accumulate action, acknowledge
+        const action = toolCallToAction(call.function.name, args);
+        if (action) actions.push(action);
+        resultContent = JSON.stringify({ result: 'noted' });
+      } else {
+        // Query tool — execute against live guild, return real data
+        resultContent = await dispatchQueryTool(call.function.name, args);
+      }
+
+      toolResults.push({
+        role: 'tool',
+        tool_call_id: call.id,
+        content: resultContent,
+      });
+    }
+
+    messages.push(...toolResults);
+  }
+
+  // If the AI called any planning tools it's a plan; otherwise it's a query answer
+  if (actions.length > 0) {
+    return {
+      kind: 'plan',
+      plan: {
+        summary: finalText || `Apply ${actions.length} change(s) to ${context.guildName}.`,
+        actions,
+      },
+    };
+  }
+
+  return {
+    kind: 'query',
+    answer: finalText || 'I could not determine an answer from the current server data.',
+  };
 }
