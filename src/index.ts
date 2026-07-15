@@ -5,6 +5,7 @@ import {
   ChannelType,
   Client,
   GatewayIntentBits,
+  MessageFlags,
   ModalBuilder,
   PermissionsBitField,
   REST,
@@ -25,10 +26,7 @@ import { dispatchQueryTool } from './query';
 const config = loadConfig();
 
 const client = new Client({
-  // GuildMembers is a privileged intent that must be enabled in the Discord Developer Portal
-  // (Bot → Privileged Gateway Intents → Server Members Intent).
-  // The bot works without it — member lookups fall back to the search API.
-  intents: [GatewayIntentBits.Guilds],
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers],
 });
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -194,7 +192,7 @@ function truncate(text: string, maxLength = 1990): string {
 
 async function handleAdmin(interaction: ChatInputCommandInteraction): Promise<void> {
   if (!interaction.inGuild() || !interaction.guild) {
-    await interaction.reply({ content: 'This command can only be used in a server.', ephemeral: true });
+    await interaction.reply({ content: 'This command can only be used in a server.', flags: MessageFlags.Ephemeral });
     return;
   }
 
@@ -205,7 +203,7 @@ async function handleAdmin(interaction: ChatInputCommandInteraction): Promise<vo
     await interaction.reply({
       content:
         'You need to be a server **Administrator** or have one of the configured bot-manager roles to use this bot.',
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -213,14 +211,13 @@ async function handleAdmin(interaction: ChatInputCommandInteraction): Promise<vo
   const prompt = interaction.options.getString('prompt', true);
   const executeImmediately = interaction.options.getBoolean('execute') ?? false;
 
-  await interaction.deferReply({ ephemeral: true });
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
-  // Try to populate member cache (requires Server Members Intent in the portal).
-  // Falls back gracefully — name lookups use the search API instead.
+  // Populate member cache so name-based lookups work without extra API calls.
   try {
     await guild.members.fetch();
   } catch {
-    // Privileged intent not enabled; member search API still works
+    // Partial cache is fine — individual lookups still work
   }
 
   const guildContext = {
@@ -282,7 +279,7 @@ async function handleAdmin(interaction: ChatInputCommandInteraction): Promise<vo
 
 async function handleList(interaction: ChatInputCommandInteraction): Promise<void> {
   if (!interaction.inGuild() || !interaction.guild) {
-    await interaction.reply({ content: 'This command can only be used in a server.', ephemeral: true });
+    await interaction.reply({ content: 'This command can only be used in a server.', flags: MessageFlags.Ephemeral });
     return;
   }
 
@@ -290,7 +287,7 @@ async function handleList(interaction: ChatInputCommandInteraction): Promise<voi
   const member = await guild.members.fetch(interaction.user.id);
 
   if (!canUseBot(member)) {
-    await interaction.reply({ content: 'You do not have permission to use this bot.', ephemeral: true });
+    await interaction.reply({ content: 'You do not have permission to use this bot.', flags: MessageFlags.Ephemeral });
     return;
   }
 
@@ -340,7 +337,7 @@ async function handleList(interaction: ChatInputCommandInteraction): Promise<voi
     lines.push(`🏷️ @${role.name}${suffix}`);
   }
 
-  await interaction.reply({ content: truncate(lines.join('\n')), ephemeral: true });
+  await interaction.reply({ content: truncate(lines.join('\n')), flags: MessageFlags.Ephemeral });
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -397,7 +394,7 @@ async function handleHelp(interaction: ChatInputCommandInteraction): Promise<voi
     examples,
   ].join('\n');
 
-  await interaction.reply({ content, ephemeral: true });
+  await interaction.reply({ content, flags: MessageFlags.Ephemeral });
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -433,7 +430,7 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.user.id !== pending.userId) {
       await interaction.reply({
         content: "You can't interact with another user's plan.",
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
       return;
     }
@@ -508,7 +505,7 @@ client.on('interactionCreate', async (interaction) => {
     if (!pending) {
       await interaction.reply({
         content: '⏰ The plan expired while the modal was open. Run `/admin` again.',
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
       return;
     }
@@ -516,7 +513,7 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.user.id !== pending.userId) {
       await interaction.reply({
         content: "You can't refine another user's plan.",
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
       return;
     }
@@ -524,7 +521,7 @@ client.on('interactionCreate', async (interaction) => {
     const followup = interaction.fields.getTextInputValue('followup');
 
     // Acknowledge the modal immediately; refinement can take a few seconds
-    await interaction.deferReply({ ephemeral: true });
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
     const guild = interaction.guild;
     if (!guild) {
@@ -594,7 +591,7 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.deferred || interaction.replied) {
       await interaction.editReply(`❌ ${message}`);
     } else {
-      await interaction.reply({ content: `❌ ${message}`, ephemeral: true });
+      await interaction.reply({ content: `❌ ${message}`, flags: MessageFlags.Ephemeral });
     }
   }
 });
