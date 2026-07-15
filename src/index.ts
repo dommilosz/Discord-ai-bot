@@ -25,7 +25,10 @@ import { dispatchQueryTool } from './query';
 const config = loadConfig();
 
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers],
+  // GuildMembers is a privileged intent that must be enabled in the Discord Developer Portal
+  // (Bot → Privileged Gateway Intents → Server Members Intent).
+  // The bot works without it — member lookups fall back to the search API.
+  intents: [GatewayIntentBits.Guilds],
 });
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -212,11 +215,12 @@ async function handleAdmin(interaction: ChatInputCommandInteraction): Promise<vo
 
   await interaction.deferReply({ ephemeral: true });
 
-  // Pre-fetch members so name-based lookups work in query mode
+  // Try to populate member cache (requires Server Members Intent in the portal).
+  // Falls back gracefully — name lookups use the search API instead.
   try {
     await guild.members.fetch();
   } catch {
-    // Partial cache is acceptable
+    // Privileged intent not enabled; member search API still works
   }
 
   const guildContext = {
@@ -400,7 +404,7 @@ async function handleHelp(interaction: ChatInputCommandInteraction): Promise<voi
 // Bot events
 // ──────────────────────────────────────────────────────────────────────────────
 
-client.once('ready', async () => {
+client.once('clientReady', async () => {
   console.log(`Logged in as ${client.user?.tag}`);
   try {
     await registerCommands();
