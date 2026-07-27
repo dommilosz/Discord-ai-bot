@@ -87,6 +87,13 @@ function coerceAction(raw: unknown): unknown {
     if (text !== undefined) a.text = text;
   }
 
+  // Gemini often sends explicit null for optional fields — Zod optional() rejects null.
+  for (const key of Object.keys(a)) {
+    if (a[key] === null) {
+      delete a[key];
+    }
+  }
+
   delete a.newName;
   delete a.new_name;
 
